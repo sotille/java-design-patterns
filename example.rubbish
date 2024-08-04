@@ -1,0 +1,1125 @@
+import org.hibernate.ScrollableResults;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
+
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
+/**
+ * Abstract class for migrating data from a source database to a target database.
+ * This class uses ScrollableResults to handle large data sets and manages the process with multi-threading.
+ * It also provides a mechanism for mini-batches to control memory usage and transaction management.
+ */
+public abstract class AbstractTableMigrationService implements Runnable {
+
+    protected final SourceDBRepository sourceDBRepository;
+    protected final TargetDBRepository targetDBRepository;
+    protected final MigrationHistoryRepository migrationHistoryRepository;
+    protected final ThreadPoolTaskExecutor taskExecutor;
+    protected final String tableName;
+    protected final IdentifierType identifierType;
+    protected final String identifierName;
+    protected final int batchSize; // Size of the batch for migration and transaction
+    protected final int miniBatchSize; // Size of mini batches for flushes
+    protected final int threadCount;
+    protected final String insertSql;
+    protected final String[] columnNames;
+
+    /**
+     * Constructor to initialize the abstract migration service.
+     *
+     * @param sourceDBRepository          Repository for accessing the source database.
+     * @param targetDBRepository          Repository for accessing the target database.
+     * @param migrationHistoryRepository  Repository for storing migration history.
+     * @param taskExecutor                Executor for handling multi-threading.
+     * @param tableName                   Name of the table being migrated.
+     * @param identifierType              Type of the identifier (e.g., LONG, STRING, DATE).
+     * @param identifierName              Name of the identifier column.
+     * @param batchSize                   Size of the batch for migration and transaction.
+     * @param miniBatchSize               Size of mini batches for flushes.
+     * @param threadCount                 Number of threads to be used.
+     * @param insertSql                   SQL query for inserting data into the target table.
+     * @param columnNames                 Names of the columns for the insert operation.
+     */
+    @Autowired
+    public AbstractTableMigrationService(SourceDBRepository sourceDBRepository,
+                                         TargetDBRepository targetDBRepository,
+                                         MigrationHistoryRepository migrationHistoryRepository,
+                                         ThreadPoolTaskExecutor taskExecutor,
+                                         String tableName,
+                                         IdentifierType identifierType,
+                                         String identifierName,
+                                         int batchSize,
+                                         int miniBatchSize,
+                                         int threadCount,
+                                         String insertSql,
+                                         String[] columnNames) {
+        this.sourceDBRepository = sourceDBRepository;
+        this.targetDBRepository = targetDBRepository;
+        this.migrationHistoryRepository = migrationHistoryRepository;
+        this.taskExecutor = taskExecutor;
+        this.tableName = tableName;
+        this.identifierType = identifierType;
+        this.identifierName = identifierName;
+        this.batchSize = batchSize;
+        this.miniBatchSize = miniBatchSize;
+        this.threadCount = threadCount;
+        this.insertSql = insertSql;
+        this.columnNames = columnNames;
+    }
+
+    /**
+     * Main method for executing the migration. This method is called when the migration starts
+     * and manages the overall process, including threading, batching, and history recording.
+     */
+    @Override
+    public void run() {
+        ExecutorService executorService = Executors.newFixedThreadPool(threadCount);
+
+        try {
+            Object maxId = sourceDBRepository.findMaxId(tableName, identifierName, identifierType);
+            Object lastProcessedId = getLastProcessedId(tableName);
+
+            while (compareIds(lastProcessedId, maxId) < 0) {
+                Object startId = incrementId(lastProcessedId);
+                Object endId = findEndId(startId, maxId, batchSize);
+
+                MigrationHistory history = new MigrationHistoryBuilder()
+                        .withTableName(tableName)
+                        .withBatchStartId(startId.toString())
+                        .withBatchEndId(endId.toString())
+                        .withStatus("IN_PROGRESS")
+                        .build();
+
+                migrationHistoryRepository.save(history);
+
+                CompletableFuture<ScrollableResults> resultsFuture = CompletableFuture.supplyAsync(
+                        () -> sourceDBRepository.fetchBatchScrollable(tableName, identifierName, identifierType, startId, endId),
+                        executorService
+                );
+
+                resultsFuture.thenAcceptAsync(results -> {
+                    targetDBRepository.processBatch(results, insertSql, columnNames, miniBatchSize);
+                    updateMigrationHistoryStatus(history.getId(), "COMPLETED", null);
+                }, executorService).get();
+
+                lastProcessedId = endId;
+            }
+
+            executorService.shutdown();
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+    /**
+     * Method to be implemented by subclasses to increment the identifier.
+     *
+     * @param currentId The current identifier.
+     * @return The incremented identifier.
+     */
+    protected abstract Object incrementId(Object currentId);
+
+    /**
+     * Method to be implemented by subclasses to find the end identifier for the batch.
+     *
+     * @param startId   The start identifier for the batch.
+     * @param maxId     The maximum identifier in the table.
+     * @param batchSize The size of the batch.
+     * @return The end identifier for the batch.
+     */
+    protected abstract Object findEndId(Object startId, Object maxId, int batchSize);
+
+    /**
+     * Method to be implemented by subclasses to compare two identifiers.
+     *
+     * @param id1 The first identifier.
+     * @param id2 The second identifier.
+     * @return An integer indicating the comparison result.
+     */
+    protected abstract int compareIds(Object id1, Object id2);
+
+    /**
+     * Retrieves the last processed identifier from the migration history.
+     *
+     * @param tableName The name of the table being migrated.
+     * @return The last processed identifier, or null if no ID has been processed.
+     */
+    private Object getLastProcessedId(String tableName) {
+        return migrationHistoryRepository.findLastProcessedIdByTableName(tableName)
+                .orElse(null); // If null, indicates that no ID has been processed yet
+    }
+
+    /**
+     * Updates the status of the migration history after processing a batch.
+     *
+     * @param historyId   The ID of the migration history record.
+     * @param status      The status to be updated (e.g., "COMPLETED", "FAILED").
+     * @param errorMessage An error message, if applicable.
+     */
+    private void updateMigrationHistoryStatus(Long historyId, String status, String errorMessage) {
+        MigrationHistory history = migrationHistoryRepository.findById(historyId).orElseThrow();
+        history.setStatus(status);
+        history.setErrorMessage(errorMessage);
+        migrationHistoryRepository.save(history);
+    }
+
+    /**
+     * Builder class for constructing MigrationHistory objects in a fluent manner.
+     */
+    public static class MigrationHistoryBuilder {
+        private String tableName;
+        private String batchStartId;
+        private String batchEndId;
+        private String status;
+
+        public MigrationHistoryBuilder withTableName(String tableName) {
+            this.tableName = tableName;
+            return this;
+        }
+
+        public MigrationHistoryBuilder withBatchStartId(String batchStartId) {
+            this.batchStartId = batchStartId;
+            return this;
+        }
+
+        public MigrationHistoryBuilder withBatchEndId(String batchEndId) {
+            this.batchEndId = batchEndId;
+            return this;
+        }
+
+        public MigrationHistoryBuilder withStatus(String status) {
+            this.status = status;
+            return this;
+        }
+
+        public MigrationHistory build() {
+            MigrationHistory history = new MigrationHistory();
+            history.setTableName(tableName);
+            history.setBatchStartId(batchStartId);
+            history.setBatchEndId(batchEndId);
+            history.setStatus(status);
+            return history;
+        }
+    }
+}
+
+
+
+
+
+
+import org.hibernate.ScrollableResults;
+import org.hibernate.Session;
+import org.hibernate.SessionFactory;
+import org.hibernate.query.Query;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Repository;
+
+/**
+ * Repository for accessing the source database.
+ * This class provides methods to retrieve data using ScrollableResults,
+ * which allows for efficient processing of large datasets.
+ */
+@Repository
+public class SourceDBRepository {
+
+    private final SessionFactory sessionFactory;
+
+    /**
+     * Constructor to initialize the SourceDBRepository.
+     *
+     * @param sessionFactory The Hibernate SessionFactory used to create sessions.
+     */
+    @Autowired
+    public SourceDBRepository(SessionFactory sessionFactory) {
+        this.sessionFactory = sessionFactory;
+    }
+
+    /**
+     * Finds the maximum value of the identifier in the specified table.
+     *
+     * @param tableName      The name of the table.
+     * @param identifierName The name of the identifier column(s).
+     *                        For composite keys, this should be a comma-separated list of columns.
+     * @param identifierType The type of the identifier (e.g., LONG, STRING, DATE, COMPOSITE).
+     * @return The maximum value of the identifier.
+     */
+    public Object findMaxId(String tableName, String identifierName, IdentifierType identifierType) {
+        try (Session session = sessionFactory.openSession()) {
+            String hql;
+
+            if (identifierType == IdentifierType.COMPOSITE) {
+                // Example for composite keys: CONCAT(id_part1, '-', id_part2)
+                hql = "SELECT MAX(CONCAT(" + identifierName + ")) FROM " + tableName;
+            } else {
+                hql = "SELECT MAX(" + identifierName + ") FROM " + tableName;
+            }
+
+            Query<?> query = session.createQuery(hql);
+
+            return query.uniqueResult();
+        }
+    }
+
+    /**
+     * Fetches a scrollable batch of results from the specified table using the provided identifier range.
+     *
+     * @param tableName      The name of the table.
+     * @param identifierName The name of the identifier column.
+     * @param identifierType The type of the identifier (e.g., LONG, STRING, DATE, COMPOSITE).
+     * @param startId        The start identifier for the batch.
+     * @param endId          The end identifier for the batch.
+     * @return A ScrollableResults object containing the batch of results.
+     */
+    public ScrollableResults fetchBatchScrollable(String tableName, String identifierName, IdentifierType identifierType, Object startId, Object endId) {
+        if (identifierType == IdentifierType.COMPOSITE) {
+            return fetchCompositeScrollable(tableName, identifierName, startId, endId);
+        } else {
+            try (Session session = sessionFactory.openSession()) {
+                String hql = String.format("FROM %s WHERE %s BETWEEN :startId AND :endId ORDER BY %s ASC", tableName, identifierName, identifierName);
+                Query<?> query = session.createQuery(hql);
+                query.setParameter("startId", startId);
+                query.setParameter("endId", endId);
+
+                return query.scroll();
+            }
+        }
+    }
+
+    /**
+     * Fetches a scrollable batch of results from the specified table for composite keys using the provided identifier range.
+     *
+     * @param tableName      The name of the table.
+     * @param identifierName The name of the identifier column(s) (concatenated fields).
+     * @param startId        The start identifier for the batch.
+     * @param endId          The end identifier for the batch.
+     * @return A ScrollableResults object containing the batch of results.
+     */
+    private ScrollableResults fetchCompositeScrollable(String tableName, String identifierName, Object startId, Object endId) {
+        try (Session session = sessionFactory.openSession()) {
+            String hql = String.format("FROM %s WHERE CONCAT(%s) BETWEEN :startId AND :endId ORDER BY CONCAT(%s) ASC", tableName, identifierName, identifierName);
+            Query<?> query = session.createQuery(hql);
+            query.setParameter("startId", startId);
+            query.setParameter("endId", endId);
+
+            return query.scroll();
+        }
+    }
+}
+
+
+
+
+import org.hibernate.Session;
+import org.hibernate.SessionFactory;
+import org.hibernate.query.NativeQuery;
+import org.hibernate.ScrollableResults;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Repository;
+
+/**
+ * Repository for accessing the target database.
+ * This class provides methods to insert data into the target database and manage transactions,
+ * including the use of mini-batches for controlling memory usage during large data migrations.
+ */
+@Repository
+public class TargetDBRepository {
+
+    private final SessionFactory sessionFactory;
+
+    /**
+     * Constructor to initialize the TargetDBRepository.
+     *
+     * @param sessionFactory The Hibernate SessionFactory used to create sessions.
+     */
+    @Autowired
+    public TargetDBRepository(SessionFactory sessionFactory) {
+        this.sessionFactory = sessionFactory;
+    }
+
+    /**
+     * Processes a batch of results, inserting them into the target database using the provided SQL.
+     * The method uses mini-batches to control memory usage and manage transactions efficiently.
+     *
+     * @param results       The ScrollableResults object containing the batch of results.
+     * @param insertSql     The SQL query used to insert data into the target table.
+     * @param columnNames   The names of the columns to be inserted.
+     * @param miniBatchSize The size of the mini-batches for flushing and clearing the session.
+     */
+    public void processBatch(ScrollableResults results, String insertSql, String[] columnNames, int miniBatchSize) {
+        Session session = sessionFactory.getCurrentSession();
+        session.beginTransaction(); // Start the transaction
+
+        int count = 0;
+
+        try {
+            while (results.next()) {
+                Object[] row = results.get();
+
+                // Insert the row into the target database using native SQL
+                NativeQuery<?> query = session.createNativeQuery(insertSql);
+                for (int i = 0; i < columnNames.length; i++) {
+                    query.setParameter(columnNames[i], row[i]);
+                }
+                query.executeUpdate();
+
+                count++;
+
+                if (count % miniBatchSize == 0) {
+                    // Perform a mini flush and clear to free memory
+                    session.flush();
+                    session.clear();
+                }
+            }
+
+            // Ensure that all remaining data is flushed and the session is cleared
+            session.flush();
+            session.clear();
+
+            session.getTransaction().commit(); // Commit the transaction
+        } catch (Exception e) {
+            session.getTransaction().rollback(); // Rollback the transaction in case of an error
+            throw e;
+        }
+    }
+
+    /**
+     * Begins a new transaction. This method can be called to explicitly start a transaction
+     * if more control is needed outside of the processBatch method.
+     */
+    public void beginTransaction() {
+        Session session = sessionFactory.getCurrentSession();
+        session.beginTransaction();
+    }
+
+    /**
+     * Commits the current transaction. This method should be called after successfully
+     * processing a batch to ensure that all changes are persisted.
+     */
+    public void commitTransaction() {
+        Session session = sessionFactory.getCurrentSession();
+        session.getTransaction().commit();
+    }
+
+    /**
+     * Rolls back the current transaction. This method should be called in case of an error
+     * during the processing of a batch to revert all changes.
+     */
+    public void rollbackTransaction() {
+        Session session = sessionFactory.getCurrentSession();
+        session.getTransaction().rollback();
+    }
+
+    /**
+     * Flushes and clears the current session. This method is used to free memory by flushing
+     * the current state of the session to the database and clearing the session cache.
+     */
+    public void flushAndClear() {
+        Session session = sessionFactory.getCurrentSession();
+        session.flush();
+        session.clear();
+    }
+}
+	
+
+
+
+
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.stereotype.Repository;
+
+import java.util.Optional;
+
+/**
+ * Repository for managing MigrationHistory entities.
+ * This repository provides methods to track the migration progress and allows
+ * the process to be resumed from the last processed identifier.
+ */
+@Repository
+public interface MigrationHistoryRepository extends JpaRepository<MigrationHistory, Long> {
+
+    /**
+     * Finds the last processed identifier for the specified table.
+     *
+     * @param tableName The name of the table being migrated.
+     * @return An Optional containing the last processed identifier, or empty if none exists.
+     */
+    @Query("SELECT m.batchEndId FROM MigrationHistory m WHERE m.tableName = :tableName ORDER BY m.id DESC")
+    Optional<String> findLastProcessedIdByTableName(String tableName);
+}
+
+
+
+
+import org.hibernate.Session;
+import org.hibernate.SessionFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Repository;
+
+import java.util.List;
+import java.util.Optional;
+
+/**
+ * Repository for managing MigrationHistory entities using Hibernate's SessionFactory and native SQL.
+ * This repository provides methods to track the migration progress, retrieve failed batches,
+ * and allows the process to be resumed from the last processed identifier.
+ */
+@Repository
+public class MigrationHistoryRepository {
+
+    private final SessionFactory sessionFactory;
+
+    /**
+     * Constructor to initialize the MigrationHistoryRepository with the provided SessionFactory.
+     *
+     * @param sessionFactory The Hibernate SessionFactory used to create sessions.
+     */
+    @Autowired
+    public MigrationHistoryRepository(SessionFactory sessionFactory) {
+        this.sessionFactory = sessionFactory;
+    }
+
+    /**
+     * Finds the last processed identifier for the specified table.
+     *
+     * @param tableName The name of the table being migrated.
+     * @return An Optional containing the last processed identifier, or empty if none exists.
+     */
+    public Optional<String> findLastProcessedIdByTableName(String tableName) {
+        try (Session session = sessionFactory.openSession()) {
+            String sql = "SELECT batch_end_id FROM migration_history WHERE table_name = :tableName ORDER BY id DESC LIMIT 1";
+            String lastProcessedId = (String) session.createNativeQuery(sql)
+                    .setParameter("tableName", tableName)
+                    .uniqueResult();
+            return Optional.ofNullable(lastProcessedId);
+        }
+    }
+
+    /**
+     * Finds all batches that failed for the specified table.
+     *
+     * @param tableName The name of the table being migrated.
+     * @return A list of MigrationHistory entities representing the failed batches.
+     */
+    public List<MigrationHistory> findFailedBatchesByTableName(String tableName) {
+        try (Session session = sessionFactory.openSession()) {
+            String sql = "SELECT * FROM migration_history WHERE table_name = :tableName AND status = 'FAILED'";
+            return session.createNativeQuery(sql, MigrationHistory.class)
+                    .setParameter("tableName", tableName)
+                    .list();
+        }
+    }
+
+    /**
+     * Saves a MigrationHistory entity to the database.
+     *
+     * @param migrationHistory The MigrationHistory entity to be saved.
+     */
+    public void save(MigrationHistory migrationHistory) {
+        try (Session session = sessionFactory.openSession()) {
+            session.beginTransaction();
+            session.saveOrUpdate(migrationHistory);
+            session.getTransaction().commit();
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to save migration history", e);
+        }
+    }
+
+    /**
+     * Finds a MigrationHistory entity by its ID.
+     *
+     * @param id The ID of the MigrationHistory entity.
+     * @return The MigrationHistory entity.
+     */
+    public MigrationHistory findById(Long id) {
+        try (Session session = sessionFactory.openSession()) {
+            return session.get(MigrationHistory.class, id);
+        }
+    }
+}
+
+
+import javax.persistence.*;
+import java.io.Serializable;
+
+/**
+ * Entity representing the history of a migration batch.
+ * This entity is used to track the progress of the migration, including the status of each batch processed.
+ */
+@Entity
+@Table(name = "migration_history")
+public class MigrationHistory implements Serializable {
+
+    private static final long serialVersionUID = 1L;
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Column(name = "table_name", nullable = false)
+    private String tableName;
+
+    @Column(name = "batch_start_id", nullable = false)
+    private String batchStartId;
+
+    @Column(name = "batch_end_id", nullable = false)
+    private String batchEndId;
+
+    @Column(name = "status", nullable = false)
+    private String status;
+
+    @Column(name = "error_message")
+    private String errorMessage;
+
+    // Getters and Setters
+
+    /**
+     * Gets the ID of the migration history record.
+     *
+     * @return The ID of the migration history record.
+     */
+    public Long getId() {
+        return id;
+    }
+
+    /**
+     * Sets the ID of the migration history record.
+     *
+     * @param id The ID of the migration history record.
+     */
+    public void setId(Long id) {
+        this.id = id;
+    }
+
+    /**
+     * Gets the name of the table being migrated.
+     *
+     * @return The name of the table being migrated.
+     */
+    public String getTableName() {
+        return tableName;
+    }
+
+    /**
+     * Sets the name of the table being migrated.
+     *
+     * @param tableName The name of the table being migrated.
+     */
+    public void setTableName(String tableName) {
+        this.tableName = tableName;
+    }
+
+    /**
+     * Gets the start ID of the batch.
+     *
+     * @return The start ID of the batch.
+     */
+    public String getBatchStartId() {
+        return batchStartId;
+    }
+
+    /**
+     * Sets the start ID of the batch.
+     *
+     * @param batchStartId The start ID of the batch.
+     */
+    public void setBatchStartId(String batchStartId) {
+        this.batchStartId = batchStartId;
+    }
+
+    /**
+     * Gets the end ID of the batch.
+     *
+     * @return The end ID of the batch.
+     */
+    public String getBatchEndId() {
+        return batchEndId;
+    }
+
+    /**
+     * Sets the end ID of the batch.
+     *
+     * @param batchEndId The end ID of the batch.
+     */
+    public void setBatchEndId(String batchEndId) {
+        this.batchEndId = batchEndId;
+    }
+
+    /**
+     * Gets the status of the batch.
+     *
+     * @return The status of the batch.
+     */
+    public String getStatus() {
+        return status;
+    }
+
+    /**
+     * Sets the status of the batch.
+     *
+     * @param status The status of the batch.
+     */
+    public void setStatus(String status) {
+        this.status = status;
+    }
+
+    /**
+     * Gets the error message associated with the batch, if any.
+     *
+     * @return The error message associated with the batch.
+     */
+    public String getErrorMessage() {
+        return errorMessage;
+    }
+
+    /**
+     * Sets the error message associated with the batch.
+     *
+     * @param errorMessage The error message associated with the batch.
+     */
+    public void setErrorMessage(String errorMessage) {
+        this.errorMessage = errorMessage;
+    }
+}
+
+
+
+
+
+
+import org.springframework.stereotype.Service;
+
+/**
+ * Service for migrating data from a source table to a target table using a composite key as the identifier.
+ * This service extends the AbstractTableMigrationService and provides specific implementations
+ * for incrementing, finding, and comparing composite keys.
+ */
+@Service
+public class CompositeKeyMigrationService extends AbstractTableMigrationService {
+
+    private static final String INSERT_SQL = "INSERT INTO target_table (id_part1, id_part2, name, created_at) VALUES (:id_part1, :id_part2, :name, :created_at)";
+    private static final String[] COLUMN_NAMES = {"id_part1", "id_part2", "name", "created_at"};
+
+    /**
+     * Constructor to initialize the CompositeKeyMigrationService.
+     *
+     * @param sourceDBRepository          Repository for accessing the source database.
+     * @param targetDBRepository          Repository for accessing the target database.
+     * @param migrationHistoryRepository  Repository for storing migration history.
+     * @param taskExecutor                Executor for handling multi-threading.
+     */
+    public CompositeKeyMigrationService(SourceDBRepository sourceDBRepository,
+                                        TargetDBRepository targetDBRepository,
+                                        MigrationHistoryRepository migrationHistoryRepository,
+                                        ThreadPoolTaskExecutor taskExecutor) {
+        super(sourceDBRepository, targetDBRepository, migrationHistoryRepository, taskExecutor,
+              "source_table", IdentifierType.COMPOSITE, "id_part1, id_part2", 5000, 1000, 4, INSERT_SQL, COLUMN_NAMES);
+    }
+
+    /**
+     * Increments the composite key.
+     *
+     * @param currentId The current composite key identifier.
+     * @return The incremented composite key identifier.
+     */
+    @Override
+    protected Object incrementId(Object currentId) {
+        CompositeKey compositeKey = (CompositeKey) currentId;
+        return compositeKey.increment();
+    }
+
+    /**
+     * Finds the end identifier for the current batch.
+     *
+     * @param startId   The start identifier for the batch.
+     * @param maxId     The maximum identifier in the table.
+     * @param batchSize The size of the batch.
+     * @return The end identifier for the batch.
+     */
+    @Override
+    protected Object findEndId(Object startId, Object maxId, int batchSize) {
+        CompositeKey compositeKey = (CompositeKey) startId;
+        for (int i = 0; i < batchSize - 1; i++) {
+            compositeKey = compositeKey.increment();
+            if (compositeKey.compareTo((CompositeKey) maxId) > 0) {
+                return maxId;
+            }
+        }
+        return compositeKey;
+    }
+
+    /**
+     * Compares two composite key identifiers.
+     *
+     * @param id1 The first identifier.
+     * @param id2 The second identifier.
+     * @return An integer indicating the comparison result.
+     */
+    @Override
+    protected int compareIds(Object id1, Object id2) {
+        return ((CompositeKey) id1).compareTo((CompositeKey) id2);
+    }
+}
+
+
+
+import org.springframework.stereotype.Service;
+
+import java.util.Calendar;
+import java.util.Date;
+
+/**
+ * Service for migrating data from a source table to a target table using a Date as the identifier.
+ * This service extends the AbstractTableMigrationService and provides specific implementations
+ * for incrementing, finding, and comparing date identifiers.
+ */
+@Service
+public class DateMigrationService extends AbstractTableMigrationService {
+
+    private static final String INSERT_SQL = "INSERT INTO target_table (date_id, name, created_at) VALUES (:date_id, :name, :created_at)";
+    private static final String[] COLUMN_NAMES = {"date_id", "name", "created_at"};
+
+    /**
+     * Constructor to initialize the DateMigrationService.
+     *
+     * @param sourceDBRepository          Repository for accessing the source database.
+     * @param targetDBRepository          Repository for accessing the target database.
+     * @param migrationHistoryRepository  Repository for storing migration history.
+     * @param taskExecutor                Executor for handling multi-threading.
+     */
+    public DateMigrationService(SourceDBRepository sourceDBRepository,
+                                TargetDBRepository targetDBRepository,
+                                MigrationHistoryRepository migrationHistoryRepository,
+                                ThreadPoolTaskExecutor taskExecutor) {
+        super(sourceDBRepository, targetDBRepository, migrationHistoryRepository, taskExecutor,
+              "source_table", IdentifierType.DATE, "date_id", 5000, 1000, 4, INSERT_SQL, COLUMN_NAMES);
+    }
+
+    /**
+     * Increments the date identifier by one second.
+     *
+     * @param currentId The current date identifier.
+     * @return The incremented date identifier.
+     */
+    @Override
+    protected Object incrementId(Object currentId) {
+        Calendar calendar = Calendar.getInstance();
+        calendar.setTime((Date) currentId);
+        calendar.add(Calendar.SECOND, 1); // Increment by 1 second
+        return calendar.getTime();
+    }
+
+    /**
+     * Finds the end identifier for the current batch.
+     *
+     * @param startId   The start identifier for the batch.
+     * @param maxId     The maximum identifier in the table.
+     * @param batchSize The size of the batch.
+     * @return The end identifier for the batch.
+     */
+    @Override
+    protected Object findEndId(Object startId, Object maxId, int batchSize) {
+        Calendar calendar = Calendar.getInstance();
+        calendar.setTime((Date) startId);
+        calendar.add(Calendar.SECOND, batchSize - 1); // Increment by batchSize seconds
+        Date endId = calendar.getTime();
+        return endId.before((Date) maxId) ? endId : maxId;
+    }
+
+    /**
+     * Compares two date identifiers.
+     *
+     * @param id1 The first identifier.
+     * @param id2 The second identifier.
+     * @return An integer indicating the comparison result.
+     */
+    @Override
+    protected int compareIds(Object id1, Object id2) {
+        return ((Date) id1).compareTo((Date) id2);
+    }
+}
+
+
+import org.springframework.stereotype.Service;
+
+/**
+ * Service for migrating data from a source table to a target table using a String as the identifier.
+ * This service extends the AbstractTableMigrationService and provides specific implementations
+ * for incrementing, finding, and comparing string identifiers.
+ */
+@Service
+public class StringMigrationService extends AbstractTableMigrationService {
+
+    private static final String INSERT_SQL = "INSERT INTO target_table (string_id, name, created_at) VALUES (:string_id, :name, :created_at)";
+    private static final String[] COLUMN_NAMES = {"string_id", "name", "created_at"};
+
+    /**
+     * Constructor to initialize the StringMigrationService.
+     *
+     * @param sourceDBRepository          Repository for accessing the source database.
+     * @param targetDBRepository          Repository for accessing the target database.
+     * @param migrationHistoryRepository  Repository for storing migration history.
+     * @param taskExecutor                Executor for handling multi-threading.
+     */
+    public StringMigrationService(SourceDBRepository sourceDBRepository,
+                                  TargetDBRepository targetDBRepository,
+                                  MigrationHistoryRepository migrationHistoryRepository,
+                                  ThreadPoolTaskExecutor taskExecutor) {
+        super(sourceDBRepository, targetDBRepository, migrationHistoryRepository, taskExecutor,
+              "source_table", IdentifierType.STRING, "string_id", 5000, 1000, 4, INSERT_SQL, COLUMN_NAMES);
+    }
+
+    /**
+     * Increments the string identifier. This example adds an "a" at the end of the string.
+     *
+     * @param currentId The current string identifier.
+     * @return The incremented string identifier.
+     */
+    @Override
+    protected Object incrementId(Object currentId) {
+        return currentId.toString() + "a";
+    }
+
+    /**
+     * Finds the end identifier for the current batch.
+     *
+     * @param startId   The start identifier for the batch.
+     * @param maxId     The maximum identifier in the table.
+     * @param batchSize The size of the batch.
+     * @return The end identifier for the batch.
+     */
+    @Override
+    protected Object findEndId(Object startId, Object maxId, int batchSize) {
+        String endId = startId.toString();
+        for (int i = 0; i < batchSize - 1; i++) {
+            endId = incrementId(endId).toString();
+            if (endId.compareTo(maxId.toString()) > 0) {
+                return maxId;
+            }
+        }
+        return endId;
+    }
+
+    /**
+     * Compares two string identifiers.
+     *
+     * @param id1 The first identifier.
+     * @param id2 The second identifier.
+     * @return An integer indicating the comparison result.
+     */
+    @Override
+    protected int compareIds(Object id1, Object id2) {
+        return id1.toString().compareTo(id2.toString());
+    }
+}
+
+
+
+
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
+
+import java.util.concurrent.Executor;
+
+/**
+ * Configuration class for setting up the ThreadPoolTaskExecutor.
+ * This executor is used to manage the threads in the migration process, ensuring that
+ * tasks are executed concurrently and efficiently.
+ */
+@Configuration
+public class ThreadPoolTaskExecutorConfig {
+
+    /**
+     * Creates and configures a ThreadPoolTaskExecutor bean.
+     *import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Component;
+
+import java.util.List;
+
+/**
+ * Orchestrates the execution of migration services in a specific order.
+ * The MigrationRunner ensures that dependent tables are migrated in the correct sequence
+ * and that independent tables can be migrated in parallel.
+ */
+@Component
+public class MigrationRunner {
+
+    private final List<TableMigrationService> orderedMigrationServices;
+    private final List<TableMigrationService> independentMigrationServices;
+    private final ThreadPoolTaskExecutor taskExecutor;
+
+    /**
+     * Constructor to initialize the MigrationRunner.
+     *
+     * @param orderedMigrationServices    The list of migration services that need to be executed in order.
+     * @param independentMigrationServices The list of independent migration services that can be executed in parallel.
+     * @param taskExecutor                The executor for handling multi-threading.
+     */
+    @Autowired
+    public MigrationRunner(List<TableMigrationService> orderedMigrationServices,
+                           List<TableMigrationService> independentMigrationServices,
+                           ThreadPoolTaskExecutor taskExecutor) {
+        this.orderedMigrationServices = orderedMigrationServices;
+        this.independentMigrationServices = independentMigrationServices;
+        this.taskExecutor = taskExecutor;
+    }
+
+    /**
+     * Starts the migration process for all configured services.
+     */
+    public void runMigrations() {
+        // First, run independent migrations in parallel
+        for (TableMigrationService service : independentMigrationServices) {
+            taskExecutor.execute(service::run);
+        }
+
+        // Then, run ordered migrations sequentially
+        for (TableMigrationService service : orderedMigrationServices) {
+            service.run();
+        }
+    }
+}
+
+
+
+
+     * @return A configured ThreadPoolTaskExecutor.
+     */
+    @Bean(name = "taskExecutor")
+    public Executor taskExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(4); // The number of core threads
+        executor.setMaxPoolSize(8);  // The maximum number of threads
+        executor.setQueueCapacity(500); // The capacity of the queue
+        executor.setThreadNamePrefix("MigrationExecutor-");
+        executor.initialize();
+        return executor;
+    }
+}
+
+
+/**
+ * Interface defining the contract for all table migration services.
+ * Implementing classes should provide the logic for migrating a specific table,
+ * including handling the migration of data in batches and managing transactions.
+ */
+public interface TableMigrationService {
+
+    /**
+     * Runs the migration process for the specific table.
+     * This method should handle the entire migration lifecycle,
+     * including retrieving data, processing batches, and handling errors.
+     */
+    void run();
+}
+
+
+
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.InjectMocks;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
+
+import static org.mockito.Mockito.*;
+
+/**
+ * Test class for the migration services.
+ * This class uses JUnit and Mockito to test the behavior of the migration services
+ * and ensure that data is processed correctly.
+ */
+@ExtendWith(MockitoExtension.class)
+public class MigrationServiceTest {
+
+    @Mock
+    private SourceDBRepository sourceDBRepository;
+
+    @Mock
+    private TargetDBRepository targetDBRepository;
+
+    @Mock
+    private MigrationHistoryRepository migrationHistoryRepository;
+
+    @Mock
+    private ThreadPoolTaskExecutor taskExecutor;
+
+    @InjectMocks
+    private CompositeKeyMigrationService compositeKeyMigrationService;
+
+    @InjectMocks
+    private DateMigrationService dateMigrationService;
+
+    @InjectMocks
+    private StringMigrationService stringMigrationService;
+
+    @BeforeEach
+    void setUp() {
+        when(taskExecutor.submit(any(Runnable.class))).thenAnswer(invocation -> {
+            Runnable runnable = invocation.getArgument(0);
+            runnable.run();
+            return null;
+        });
+    }
+
+    @Test
+    void testCompositeKeyMigrationService() {
+        // Mocking behavior for SourceDBRepository and TargetDBRepository
+        when(sourceDBRepository.findMaxId(anyString(), anyString(), eq(IdentifierType.COMPOSITE)))
+                .thenReturn(new CompositeKey(1L, 10L));
+        when(sourceDBRepository.fetchBatchScrollable(anyString(), anyString(), eq(IdentifierType.COMPOSITE), any(), any()))
+                .thenReturn(mockScrollableResults());
+
+        // Running the migration
+        compositeKeyMigrationService.run();
+
+        // Verifying interactions
+        verify(targetDBRepository, atLeastOnce()).processBatch(any(), anyString(), any(), anyInt());
+        verify(migrationHistoryRepository, atLeastOnce()).save(any());
+    }
+
+    @Test
+    void testDateMigrationService() {
+        // Mocking behavior for SourceDBRepository and TargetDBRepository
+        when(sourceDBRepository.findMaxId(anyString(), anyString(), eq(IdentifierType.DATE)))
+                .thenReturn(new Date());
+        when(sourceDBRepository.fetchBatchScrollable(anyString(), anyString(), eq(IdentifierType.DATE), any(), any()))
+                .thenReturn(mockScrollableResults());
+
+        // Running the migration
+        dateMigrationService.run();
+
+        // Verifying interactions
+        verify(targetDBRepository, atLeastOnce()).processBatch(any(), anyString(), any(), anyInt());
+        verify(migrationHistoryRepository, atLeastOnce()).save(any());
+    }
+
+    @Test
+    void testStringMigrationService() {
+        // Mocking behavior for SourceDBRepository and TargetDBRepository
+        when(sourceDBRepository.findMaxId(anyString(), anyString(), eq(IdentifierType.STRING)))
+                .thenReturn("stringMaxId");
+        when(sourceDBRepository.fetchBatchScrollable(anyString(), anyString(), eq(IdentifierType.STRING), any(), any()))
+                .thenReturn(mockScrollableResults());
+
+        // Running the migration
+        stringMigrationService.run();
+
+        // Verifying interactions
+        verify(targetDBRepository, atLeastOnce()).processBatch(any(), anyString(), any(), anyInt());
+        verify(migrationHistoryRepository, atLeastOnce()).save(any());
+    }
+
+    private ScrollableResults mockScrollableResults() {
+        ScrollableResults results = mock(ScrollableResults.class);
+        when(results.next()).thenReturn(true, true, false);
+        when(results.get()).thenReturn(new Object[]{"value1", "value2"});
+        return results;
+    }
+}
+
